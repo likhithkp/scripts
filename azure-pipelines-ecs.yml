@@ -1,0 +1,124 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  AWS_REGION: 'eu-central-1'
+
+steps:
+- task: Go@0
+  inputs:
+    command: 'get'
+    arguments: '-d'
+    workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+- task: Go@0
+  inputs:
+    command: 'build'
+    workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: '$(System.DefaultWorkingDirectory)'
+    Contents: '**'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'drop'
+    publishLocation: 'Container'
+
+- task: Bash@3
+  displayName: 'Compute next IMAGE_TAG and login to ECR'
+  name: ComputeImageTag
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)         
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY) 
+    AWS_DEFAULT_REGION: $(AWS_REGION)
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Logging into AWS ECR..."
+      aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $(AWS_ECR_IMAGE_URI_DEV)
+
+      echo "Fetching latest dev image tag from ECR..."
+      LATEST_TAG=$(aws ecr list-images \
+        --repository-name $(AWS_ECR_REPOSITORY_NAME_DEV) \
+        --query 'imageIds[*].imageTag' \
+        --output text | tr '\t' '\n' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-dev$' | sort -V | tail -n1)
+
+      if [ -z "$LATEST_TAG" ]; then
+        NEW_TAG="v0.0.1-dev"
+      else
+        TAG_NUM=${LATEST_TAG#v}
+        TAG_NUM=${TAG_NUM%-dev}
+        IFS='.' read -r MAJOR MINOR PATCH <<< "$TAG_NUM"
+        PATCH=$((PATCH + 1))
+        NEW_TAG="v$MAJOR.$MINOR.$PATCH-dev"
+      fi
+
+      echo "Next IMAGE_TAG: $NEW_TAG"
+      echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$NEW_TAG"
+
+- task: Docker@2
+  displayName: 'Build Docker image'
+  inputs:
+    repository: '$(AWS_ECR_IMAGE_URI_DEV)'
+    command: 'build'
+    Dockerfile: '$(System.DefaultWorkingDirectory)/Dockerfile'
+    buildContext: '$(System.DefaultWorkingDirectory)'
+    tags: '$(ComputeImageTag.IMAGE_TAG)'
+
+- task: ECRPushImage@1
+  displayName: 'Push Docker image to ECR'
+  inputs:
+    awsCredentials: 'Fitnear Ecr Access'
+    regionName: '$(AWS_REGION)'
+    imageSource: 'imagename'
+    sourceImageName: $(AWS_ECR_IMAGE_URI_DEV)
+    sourceImageTag: $(ComputeImageTag.IMAGE_TAG)
+    pushTag: $(ComputeImageTag.IMAGE_TAG)
+    repositoryName: $(AWS_ECR_REPOSITORY_NAME_DEV)
+
+- task: Bash@3
+  displayName: 'Deploy to ECS'
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: $(AWS_REGION)
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Fetching current task definition..."
+      TASK_DEF_JSON=$(aws ecs describe-task-definition \
+        --task-definition fitnear-backend-dev \
+        --query 'taskDefinition' \
+        --output json)
+
+      echo "Updating container image with new tag..."
+      NEW_TASK_DEF=$(echo "$TASK_DEF_JSON" | \
+        jq --arg IMAGE "$(AWS_ECR_IMAGE_URI_DEV):$(ComputeImageTag.IMAGE_TAG)" \
+           --arg NAME "fitnear-backend-dev" \
+        '.containerDefinitions[0].image = $IMAGE 
+         | .family = "fitnear-backend-dev" 
+         | del(.revision,.status,.taskDefinitionArn,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
+
+      echo "$NEW_TASK_DEF" > new-task-def.json
+
+      # Register new task definition and capture revision
+      NEW_REVISION=$(aws ecs register-task-definition \
+        --cli-input-json file://new-task-def.json \
+        --query 'taskDefinition.revision' \
+        --output text)
+
+      # Update service to use new revision
+      aws ecs update-service \
+        --cluster fitnear-ecs-cluster \
+        --service fitnear-backend-dev-service \
+        --task-definition fitnear-backend-dev:$NEW_REVISION \
+        --force-new-deployment
+
+      echo "ECS deployment triggered successfully with task definition revision $NEW_REVISION!"

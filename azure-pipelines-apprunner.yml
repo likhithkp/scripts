@@ -1,0 +1,105 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  AWS_REGION: 'eu-central-1'
+
+steps:
+- task: Go@0
+  inputs:
+    command: 'get'
+    arguments: '-d'
+    workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+- task: Go@0
+  inputs:
+    command: 'build'
+    workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: '$(System.DefaultWorkingDirectory)'
+    Contents: '**'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'drop'
+    publishLocation: 'Container'
+
+- task: Bash@3
+  displayName: 'Compute next IMAGE_TAG and login to ECR'
+  name: ComputeImageTag
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: $(AWS_REGION)
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Logging into AWS ECR..."
+      aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $(AWS_ECR_IMAGE_URI_DEV)
+
+      echo "Fetching latest dev image tag from ECR..."
+      LATEST_TAG=$(aws ecr list-images \
+        --repository-name $(AWS_ECR_REPOSITORY_NAME_DEV) \
+        --query 'imageIds[*].imageTag' \
+        --output text | tr '\t' '\n' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-dev$' | sort -V | tail -n1)
+
+      if [ -z "$LATEST_TAG" ]; then
+        NEW_TAG="v0.0.1-dev"
+      else
+        TAG_NUM=${LATEST_TAG#v}
+        TAG_NUM=${TAG_NUM%-dev}
+        IFS='.' read -r MAJOR MINOR PATCH <<< "$TAG_NUM"
+        PATCH=$((PATCH + 1))
+        NEW_TAG="v$MAJOR.$MINOR.$PATCH-dev"
+      fi
+
+      echo "Next IMAGE_TAG: $NEW_TAG"
+      echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$NEW_TAG"
+
+- task: Docker@2
+  displayName: 'Build Docker image'
+  inputs:
+    repository: '$(AWS_ECR_IMAGE_URI_DEV)'
+    command: 'build'
+    Dockerfile: '$(System.DefaultWorkingDirectory)/Dockerfile'
+    buildContext: '$(System.DefaultWorkingDirectory)'
+    tags: '$(ComputeImageTag.IMAGE_TAG)'
+
+- task: ECRPushImage@1
+  displayName: 'Push Docker image to ECR'
+  inputs:
+    awsCredentials: 'Fitnear Ecr Access'
+    regionName: '$(AWS_REGION)'
+    imageSource: 'imagename'
+    sourceImageName: $(AWS_ECR_IMAGE_URI_DEV)
+    sourceImageTag: $(ComputeImageTag.IMAGE_TAG)
+    pushTag: $(ComputeImageTag.IMAGE_TAG)
+    repositoryName: $(AWS_ECR_REPOSITORY_NAME_DEV)
+
+- task: Bash@3
+  displayName: 'Deploy to App Runner'
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: $(AWS_REGION)
+  inputs:
+    targetType: 'inline'
+    script: |
+      APP_RUNNER_SERVICE_NAME="fitnear-rest-api-service"
+      IMAGE_URI="$(AWS_ECR_IMAGE_URI_DEV):$(ComputeImageTag.IMAGE_TAG)"
+
+      echo "Updating App Runner service $APP_RUNNER_SERVICE_NAME with new image $IMAGE_URI..."
+      aws apprunner update-service \
+        --service-arn arn:aws:apprunner:$(AWS_REGION):043976678105:service/$APP_RUNNER_SERVICE_NAME \
+        --source-configuration ImageRepository={ImageIdentifier=$IMAGE_URI,ImageRepositoryType=ECR,ImageConfiguration={Port=8080}} \
+        --auto-deployments-enabled
+       
+      echo "App Runner deployment triggered successfully!"
+
